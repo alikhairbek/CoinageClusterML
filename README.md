@@ -1,9 +1,9 @@
 # CoinageClusterML
 Machine Learning framework for predicting binding energies and magic numbers in Cu, Ag, and Au nanoclusters (N ≤ 55) using the Open Quantum Cluster Database (OQCD). Features 7 ensemble models, SHAP interpretability, and 9 geometric descriptors.
-Machine Learning Prediction of Coinage Metal Nanocluster Stability
-Cu–Ag–Au Clusters (N ≤ 55)
+**Machine Learning Prediction of Coinage Metal Nanocluster Stability
+Cu–Ag–Au Clusters (N ≤ 55)**
 
-Overview
+**Overview**
 This repository contains the full computational framework developed for the research study:
 Machine Learning Prediction of Coinage Metal Nanocluster Stability and Magic Numbers
 The project integrates Density Functional Theory (DFT) datasets, geometric descriptors, and advanced machine learning models to predict the binding energy per atom and identify magic-number stability patterns in coinage metal nanoclusters.
@@ -15,7 +15,7 @@ for cluster sizes:
 N ≤ 55 atoms
 The workflow provides a scalable approach for predicting nanocluster stability while significantly reducing the computational cost associated with large-scale DFT calculations.
 
-Scientific Motivation
+**Scientific Motivation**
 Metal nanoclusters exhibit strong size-dependent stability patterns, often referred to as magic numbers. These clusters play an important role in:
 •	heterogeneous catalysis 
 •	plasmonic nanomaterials 
@@ -29,7 +29,7 @@ This project introduces a machine learning assisted framework capable of:
 •	identifying stability peaks (magic numbers) 
 •	analyzing structure–energy relationships 
 
-Methodology
+**Methodology**
 The computational workflow consists of five major stages.
 
 1 Dataset Construction
@@ -45,7 +45,7 @@ Each entry includes:
 The input dataset is provided as:
 CuAgAu.xlsx
 
-2 Feature Engineering
+**2 Feature Engineering**
 Atomic coordinates are converted into physically meaningful geometric descriptors that capture cluster morphology.
 Computed descriptors include:
 •	mean radial distance 
@@ -61,7 +61,7 @@ These descriptors quantify:
 •	cluster spatial distribution 
 Such features are critical for linking cluster geometry with thermodynamic stability.
 
-3 Target Variable
+**3 Target Variable**
 The machine learning models predict the binding energy per atom, defined as:
 BE_per_atom = E_DFT / N_atoms
 where:
@@ -69,7 +69,7 @@ where:
 •	N_atoms is the number of atoms in the cluster 
 This normalization enables direct comparison across clusters of different sizes.
 
-4 Machine Learning Models
+**4 Machine Learning Models**
 Seven machine learning algorithms are evaluated and compared.
 Model	Category
 ExtraTrees	Ensemble Learning
@@ -88,7 +88,7 @@ Model performance is evaluated using:
 •	Training time 
 The best-performing model is automatically selected.
 
-5 Model Interpretability
+**5 Model Interpretability**
 To understand the physical drivers of stability, the framework includes:
 •	global feature importance analysis 
 •	SHAP (SHapley Additive exPlanations) 
@@ -96,7 +96,7 @@ To understand the physical drivers of stability, the framework includes:
 •	residual analysis 
 These tools reveal the contribution of geometric and electronic descriptors to cluster stability.
 
-6 Magic Number Detection
+**6 Magic Number Detection**
 Cluster stability is further analyzed using the second energy difference criterion:
 Δ²E stability metric.
 Clusters satisfying the condition:
@@ -106,10 +106,10 @@ The framework compares:
 •	literature-reported magic numbers 
 •	newly discovered stability peaks 
 
-Generated Outputs
+**Generated Outputs**
 Running the analysis automatically generates a complete research dataset including:
 
-Figures
+**Figures**
 The pipeline produces 26 publication-quality figures, including:
 •	ML vs DFT parity plot 
 •	cluster stability vs size 
@@ -126,7 +126,7 @@ The pipeline produces 26 publication-quality figures, including:
 All figures are saved in:
 /Figures
 
-Tables
+**Tables**
 Three manuscript-ready tables are generated:
 1.	Machine learning model performance comparison 
 2.	ML predictions vs DFT energies 
@@ -134,7 +134,7 @@ Three manuscript-ready tables are generated:
 Tables are stored in:
 /Tables
 
-Automatic Manuscript Report
+**Automatic Manuscript Report**
 The script generates a formatted report:
 Full_Paper_Report_N55_DATE.docx
 The report contains:
@@ -143,7 +143,7 @@ The report contains:
 •	magic number table 
 This file can be directly used in manuscript preparation.
 
-Repository Structure
+**Repository Structure**
 IMPERIAL_FINAL_2026_N55/
 
 │
@@ -161,14 +161,14 @@ IMPERIAL_FINAL_2026_N55/
 │
 └── atomic_analysis_suite.py
 
-Installation
+**Installation**
 Python version:
 Python ≥ 3.9
 Install dependencies:
 pip install numpy pandas matplotlib seaborn scikit-learn
 pip install xgboost lightgbm catboost shap statsmodels python-docx
 
-Running the Code
+**Running the Code**
 Execute the analysis pipeline:
 python atomic_analysis_suite.py
 The script will automatically generate:
@@ -177,7 +177,7 @@ The script will automatically generate:
 •	manuscript report 
 •	compressed ZIP archive of results 
 
-Scientific Impact
+**Scientific Impact**
 This work demonstrates that machine learning models trained on DFT data can:
 •	accurately reproduce nanocluster stability trends 
 •	identify size-dependent stability patterns 
@@ -185,7 +185,7 @@ This work demonstrates that machine learning models trained on DFT data can:
 •	detect magic-number clusters 
 The framework provides a scalable alternative to expensive high-throughput DFT screening.
 
-Applications
+**Applications**
 The methodology can be extended to:
 •	alloy nanoclusters 
 •	catalytic nanoparticles 
@@ -193,16 +193,16 @@ The methodology can be extended to:
 •	high-throughput materials discovery 
 •	AI-driven nanomaterials design 
 
-Reproducibility
+**Reproducibility**
 All data preprocessing, feature engineering, model training, and visualization steps are fully automated within the provided codebase to ensure complete reproducibility of results.
 
-Author
+**Author**
 Researcher in:
 •	Computational Chemistry 
 •	Machine Learning for Materials 
 •	Nanocluster Physics 
 •	Nanostructured Materials Modeling 
 
-License
+**License**
 This repository is released under the MIT License.
 
