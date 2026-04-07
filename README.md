@@ -43,7 +43,10 @@ Each entry includes:
 •	number of valence electrons 
 •	total DFT energy 
 The input dataset is provided as:
-CuAgAu.xlsx
+*CuAgAu.xlsx* The dataset for this study was curated from the Open Quantum Cluster Database (QCD), as described in the benchmark study by Manna et al. (Nature Scientific Data, 2023). The file, denoted as CuAgAu.xlsx, contains atomically precise coordinates and DFT-calculated total energies for copper, silver, and gold nanoclusters. These structures represent candidate low-energy configurations harvested from extensive literature and further refined via first-principles calculations. In this work, we focused on the size regime of N ≤ 55 to ensure high-fidelity interpolation and physical consistency with established magic-number trends.
+### Data Sources
+- **Database:** [Open Quantum Cluster Database (QCD)](http://muellergroup.jhu.edu/qcd)
+- **Reference Paper:** [Manna et al., "A database of low-energy atomically precise nanoclusters", Nature Sci Data (2023)](https://www.nature.com/articles/s41597-023-02200-4)
 
 **2 Feature Engineering**
 Atomic coordinates are converted into physically meaningful geometric descriptors that capture cluster morphology.
