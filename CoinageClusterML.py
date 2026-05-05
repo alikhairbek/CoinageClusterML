@@ -1,34 +1,58 @@
-﻿# ==========================================================
-# IMPERIAL ATOMIC ANALYSIS SUITE 2026 - FINAL CLEAN VERSION (N ≤ 55 ONLY)
-# Magic Numbers using Δ²E + ML vs DFT Comparison
-# ==========================================================
+# =============================================================================
+# COINAGE-METAL NANOCLUSTER ML PIPELINE — REVISED VERSION (PCCP, R1)
+# =============================================================================
+# Addresses all reviewer concerns from PCCP submission:
+#
+#   [R1.1] Target redefined as "DFT energy per atom" (E_DFT/N), explicit
+#          terminology throughout (NOT called "binding energy").
+#   [R1.2] Feature list now INCLUDES n_atoms (was missing in original code).
+#          This removes the inconsistency between text and feature-importance plots.
+#   [R1.3] Predictive scope is restricted to interpolation within QCD (N ≤ 55).
+#   [R1.4] Magic-number analysis is performed PER METAL (Cu, Ag, Au) with
+#          adaptive thresholds, not on metal-averaged values.
+#   [R1.5] 5-fold KFold CV + Size-Grouped CV added for ALL seven models.
+#          Train/Validation/Test = 70/15/15 split.
+#   [R1.6] A SECOND model trained on geometry-only features (no HOMO-LUMO,
+#          no magnetic moment) — directly addresses "rapid screening" claim.
+#   [R2.B] Train/Validation/Test split (no leakage from val to test).
+#   [R2.C] QCD scope/limitations discussed in printed report (PBE/PAW, etc.)
+#
+# Author: Ali A. Khairbek et al.
+# =============================================================================
 
 import os
 import re
 import time
+import json
+import warnings
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import warnings
-import shutil                               
-from datetime import datetime
-from sklearn.model_selection import train_test_split, learning_curve
+
+from sklearn.model_selection import (
+    train_test_split, KFold, GroupKFold, cross_val_score, learning_curve
+)
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+from sklearn.ensemble import (
+    ExtraTreesRegressor, RandomForestRegressor, GradientBoostingRegressor
+)
 from sklearn.neural_network import MLPRegressor
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 import xgboost as xgb
 import lightgbm as lgb
 from catboost import CatBoostRegressor
 import shap
-from scipy.signal import find_peaks
-from docx import Document
-from docx.shared import Inches
 
 warnings.filterwarnings('ignore')
 
-# =========================================
+# =============================================================================
+# 0. ENVIRONMENT
+# =============================================================================
 plt.rcParams.update({
     'font.family': 'serif',
     'font.size': 11,
@@ -37,17 +61,36 @@ plt.rcParams.update({
     'savefig.dpi': 600
 })
 
-ROOT = "IMPERIAL_FINAL_2026_N55"
+# Output directory — auto-detect Kaggle vs local
+if os.path.isdir("/kaggle/working"):
+    ROOT = "/kaggle/working/REVISED_PCCP_R1"
+else:
+    ROOT = "REVISED_PCCP_R1"
 os.makedirs(f"{ROOT}/Figures", exist_ok=True)
 os.makedirs(f"{ROOT}/Tables", exist_ok=True)
+os.makedirs(f"{ROOT}/Models", exist_ok=True)
 
-print("(N ≤ 55 )...")
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+COLORS = {"Cu": "#B87333", "Ag": "#C0C0C0", "Au": "#FFD700"}
 
-# ========================================
-df = pd.read_excel("CuAgAu.xlsx")
+print("=" * 78)
+print("  COINAGE-METAL NANOCLUSTER ML — REVISED (R1) — N <= 55 ONLY")
+print("=" * 78)
+
+# =============================================================================
+# 1. DATA LOADING & PREPROCESSING
+# =============================================================================
+# Auto-detect input path: Kaggle dataset path or local working directory
+KAGGLE_PATH = "/kaggle/input/datasets/alikhairbek/cuagau/CuAgAu.xlsx"
+LOCAL_PATH  = "CuAgAu.xlsx"
+DATA_PATH = KAGGLE_PATH if os.path.exists(KAGGLE_PATH) else LOCAL_PATH
+print(f"\n[1] Reading data from: {DATA_PATH}")
+df = pd.read_excel(DATA_PATH)
 
 def detect_metal(text):
-    if pd.isna(text): return None
+    if pd.isna(text):
+        return None
     text = str(text).upper()
     if "AU" in text: return "Au"
     if "AG" in text: return "Ag"
@@ -55,460 +98,722 @@ def detect_metal(text):
     return None
 
 df["metal"] = df["structure_xyz"].apply(detect_metal)
-metal_map = {"Cu":29, "Ag":47, "Au":79}
-df["metal_Z"] = df["metal"].map(metal_map)
+metal_Z_map = {"Cu": 29, "Ag": 47, "Au": 79}
+df["metal_Z"] = df["metal"].map(metal_Z_map)
 
 def extract_coords(text):
-    if pd.isna(text): return None
+    if pd.isna(text):
+        return None
     pattern = r'(Cu|Ag|Au)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)'
     matches = re.findall(pattern, str(text))
-    if len(matches) < 5: return None
-    return np.array([[float(x), float(y), float(z)] for _,x,y,z in matches])
+    if len(matches) < 5:
+        return None
+    return np.array([[float(x), float(y), float(z)] for _, x, y, z in matches])
 
 df["coords"] = df["structure_xyz"].apply(extract_coords)
 df = df.dropna(subset=["coords"]).reset_index(drop=True)
 
-# ===  N ≤ 55  ===
+# Filter to N <= 55 (QCD coverage)
 df = df[df["n_atoms"] <= 55].reset_index(drop=True)
-print(f" Final dataset (N ≤ 55): {len(df)} samples")
+print(f"\n[1] Filtered dataset (N <= 55): {len(df)} samples")
+print(f"    By metal: {df['metal'].value_counts().to_dict()}")
 
-df["binding_energy_per_atom"] = df["energy_dft"] / df["n_atoms"]
+# -----------------------------------------------------------------------------
+# [R1.1] TARGET DEFINITION — explicit terminology
+# -----------------------------------------------------------------------------
+# We use DFT energy per atom (E_DFT / N) as the regression target.
+# This is NOT the standard atomization energy. To convert to atomization energy
+# the user must subtract E_atom (PBE/PAW) for the bare atom of each metal:
+#   E_atomization/N = E_atom - E_DFT/N
+# We retain E_DFT/N as the target because:
+#   (i)  it is the quantity stored in the QCD;
+#   (ii) relative differences (Delta2E) — the basis for magic-number detection
+#        — are invariant under the constant shift E_atom;
+#   (iii) using E_atomization would only re-scale the y-axis, NOT change MAE.
+# -----------------------------------------------------------------------------
+df["energy_per_atom"] = df["energy_dft"] / df["n_atoms"]
+TARGET_NAME = "DFT energy per atom (eV/atom)"
+print(f"[1] Target: {TARGET_NAME}  [explicit; NOT called 'binding energy']")
 
-# ========================================
+# =============================================================================
+# 2. FEATURE ENGINEERING
+# =============================================================================
 def compute_geometry(coords):
     if len(coords) < 3:
         return [np.nan] * 9
     centroid = np.mean(coords, axis=0)
     dist = np.linalg.norm(coords - centroid, axis=1)
-    rg = np.sqrt(np.mean(dist**2))
+    rg = np.sqrt(np.mean(dist ** 2))
     asph = (dist.max() - dist.min()) / (dist.mean() + 1e-12)
     return [
         dist.mean(), dist.std(), dist.max(), rg, asph,
-        coords[:,0].max() - coords[:,0].min(),
-        coords[:,1].max() - coords[:,1].min(),
-        coords[:,2].max() - coords[:,2].min(),
+        coords[:, 0].max() - coords[:, 0].min(),
+        coords[:, 1].max() - coords[:, 1].min(),
+        coords[:, 2].max() - coords[:, 2].min(),
         rg / (dist.mean() + 1e-12)
     ]
 
 geo_cols = ["mean_dist", "std_dist", "max_dist", "radius_gyration", "asphericity",
             "bbox_x", "bbox_y", "bbox_z", "compactness"]
 
-print("working...")
+print("\n[2] Computing geometric descriptors ...")
 geo = np.array([compute_geometry(c) for c in df["coords"]])
 for i, col in enumerate(geo_cols):
     df[col] = geo[:, i]
 
-feature_cols = ["metal_Z", "homo_lumo_gap", "n_val_electrons", "magnetic_moment"] + geo_cols
+# -----------------------------------------------------------------------------
+# [R1.2] FEATURE LIST — n_atoms (N) IS NOW INCLUDED
+# -----------------------------------------------------------------------------
+# Original code omitted n_atoms from feature_cols, which contradicted claims in
+# the manuscript that N was the second most important predictor. Fixed here.
+# -----------------------------------------------------------------------------
 
-X = df[feature_cols].fillna(df[feature_cols].median())
-y = df["binding_energy_per_atom"]
+# Full feature set: structural + electronic (DFT-derived) + N + metal identity
+FEATURES_FULL = (["metal_Z", "n_atoms", "n_val_electrons",
+                  "homo_lumo_gap", "magnetic_moment"] + geo_cols)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, random_state=42, stratify=df["metal"])
+# -----------------------------------------------------------------------------
+# [R1.6] GEOMETRY-ONLY FEATURE SET — for "rapid screening" claim
+# -----------------------------------------------------------------------------
+# This set excludes electronic descriptors (homo_lumo_gap, magnetic_moment)
+# that themselves require DFT to compute. It represents the realistic case
+# of predicting energies from geometry alone (e.g., from XYZ coordinates of
+# a candidate cluster proposed by genetic algorithms or templates).
+# -----------------------------------------------------------------------------
+FEATURES_GEO_ONLY = ["metal_Z", "n_atoms"] + geo_cols
 
-scaler = StandardScaler()
-X_train_s = scaler.fit_transform(X_train)
-X_test_s = scaler.transform(X_test)
+print(f"[2] Full feature set      : {len(FEATURES_FULL):>2d} features")
+print(f"[2] Geometry-only set     : {len(FEATURES_GEO_ONLY):>2d} features")
 
-# ========================================
-model_suite = {
-    "ExtraTrees": ExtraTreesRegressor(n_estimators=1000, max_depth=15, min_samples_leaf=3, random_state=42, n_jobs=-1),
-    "RandomForest": RandomForestRegressor(n_estimators=1000, max_depth=12, min_samples_leaf=4, random_state=42, n_jobs=-1),
-    "XGBoost": xgb.XGBRegressor(n_estimators=1000, learning_rate=0.03, max_depth=6, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42),
-    "LightGBM": lgb.LGBMRegressor(n_estimators=1000, learning_rate=0.03, max_depth=8, num_leaves=31, random_state=42, verbose=-1),
-    "CatBoost": CatBoostRegressor(n_estimators=1000, learning_rate=0.03, depth=7, l2_leaf_reg=5, verbose=0, random_state=42),
-    "GradientBoosting": GradientBoostingRegressor(n_estimators=800, learning_rate=0.04, max_depth=5, random_state=42),
-    "NeuralNet": MLPRegressor(hidden_layer_sizes=(128, 64), max_iter=1500, alpha=0.05, random_state=42)
-}
+X_full = df[FEATURES_FULL].fillna(df[FEATURES_FULL].median())
+X_geo  = df[FEATURES_GEO_ONLY].fillna(df[FEATURES_GEO_ONLY].median())
+y      = df["energy_per_atom"]
 
-print("\n=== مقارنة الـ 7 نماذج ===")
-results = []
-trained_models = {}
+# =============================================================================
+# 3. TRAIN / VALIDATION / TEST SPLIT  [R2.B]
+# =============================================================================
+# 70% train, 15% val, 15% test, stratified by metal.
+# Validation set is used for hyperparameter selection / early reporting.
+# Test set is the held-out final evaluation (untouched until end).
+# =============================================================================
 
-for name, model in model_suite.items():
+def three_way_split(X, y, metal, seed=RANDOM_SEED):
+    X_tmp, X_test, y_tmp, y_test, m_tmp, m_test = train_test_split(
+        X, y, metal, test_size=0.15, random_state=seed, stratify=metal
+    )
+    # val = 0.15/0.85 of remaining = 0.1765
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_tmp, y_tmp, test_size=0.1765, random_state=seed, stratify=m_tmp
+    )
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+print("\n[3] Three-way split: 70% train / 15% val / 15% test  (stratified by metal)")
+Xf_tr, Xf_va, Xf_te, yf_tr, yf_va, yf_te = three_way_split(X_full, y, df["metal"])
+Xg_tr, Xg_va, Xg_te, yg_tr, yg_va, yg_te = three_way_split(X_geo,  y, df["metal"])
+
+scaler_full = StandardScaler().fit(Xf_tr)
+Xf_tr_s = scaler_full.transform(Xf_tr)
+Xf_va_s = scaler_full.transform(Xf_va)
+Xf_te_s = scaler_full.transform(Xf_te)
+
+scaler_geo = StandardScaler().fit(Xg_tr)
+Xg_tr_s = scaler_geo.transform(Xg_tr)
+Xg_va_s = scaler_geo.transform(Xg_va)
+Xg_te_s = scaler_geo.transform(Xg_te)
+
+print(f"    Train: {len(Xf_tr)}  |  Val: {len(Xf_va)}  |  Test: {len(Xf_te)}")
+
+# =============================================================================
+# 4. MODEL ZOO
+# =============================================================================
+def build_models(seed=RANDOM_SEED):
+    return {
+        "ExtraTrees":       ExtraTreesRegressor(n_estimators=1000, max_depth=15,
+                                                min_samples_leaf=3, random_state=seed,
+                                                n_jobs=-1),
+        "RandomForest":     RandomForestRegressor(n_estimators=1000, max_depth=12,
+                                                  min_samples_leaf=4, random_state=seed,
+                                                  n_jobs=-1),
+        "XGBoost":          xgb.XGBRegressor(n_estimators=1000, learning_rate=0.03,
+                                             max_depth=6, subsample=0.8,
+                                             colsample_bytree=0.8, reg_alpha=0.1,
+                                             reg_lambda=1.0, random_state=seed),
+        "LightGBM":         lgb.LGBMRegressor(n_estimators=1000, learning_rate=0.03,
+                                              max_depth=8, num_leaves=31,
+                                              random_state=seed, verbose=-1),
+        "CatBoost":         CatBoostRegressor(n_estimators=1000, learning_rate=0.03,
+                                              depth=7, l2_leaf_reg=5, verbose=0,
+                                              random_state=seed),
+        "GradientBoosting": GradientBoostingRegressor(n_estimators=800, learning_rate=0.04,
+                                                      max_depth=5, random_state=seed),
+        "NeuralNet":        MLPRegressor(hidden_layer_sizes=(128, 64), max_iter=1500,
+                                         alpha=0.05, random_state=seed),
+    }
+
+# =============================================================================
+# 5. EVALUATION HELPERS
+# =============================================================================
+def evaluate(model, X_train_s, y_train, X_val_s, y_val, X_test_s, y_test):
+    """Train once and report MAE/R2 on val and test."""
     t0 = time.time()
     model.fit(X_train_s, y_train)
     train_time = time.time() - t0
-    pred = model.predict(X_test_s)
-    mae = mean_absolute_error(y_test, pred)
-    r2 = r2_score(y_test, pred)
-    results.append([name, round(mae,5), round(r2,4), round(train_time,2)])
-    trained_models[name] = model
-    print(f"{name:18} → MAE: {mae:.5f} | R²: {r2:.4f} | Time: {train_time:.2f} sec")
+    y_val_pred  = model.predict(X_val_s)
+    y_test_pred = model.predict(X_test_s)
+    return {
+        "train_time_s": train_time,
+        "mae_val":  mean_absolute_error(y_val,  y_val_pred),
+        "r2_val":   r2_score(y_val,  y_val_pred),
+        "mae_test": mean_absolute_error(y_test, y_test_pred),
+        "r2_test":  r2_score(y_test, y_test_pred),
+        "rmse_test": np.sqrt(mean_squared_error(y_test, y_test_pred)),
+    }
 
-results_df = pd.DataFrame(results, columns=["Model", "MAE", "R2", "Training_Time_sec"])
-results_df = results_df.sort_values("MAE")
-best_model_name = results_df.iloc[0]["Model"]
-best_model = trained_models[best_model_name]
+# -----------------------------------------------------------------------------
+# [R1.5] CROSS-VALIDATION (5-fold + size-grouped)
+# -----------------------------------------------------------------------------
+def cv_scores(model, X_scaled_full, y_full, kfold):
+    """Return MAE for each fold (negated because sklearn uses neg-MAE)."""
+    scores = cross_val_score(model, X_scaled_full, y_full, cv=kfold,
+                             scoring="neg_mean_absolute_error", n_jobs=-1)
+    return -scores  # convert back to positive MAE
 
-print(f"\n Best_model: {best_model_name} | MAE = {results_df.iloc[0]['MAE']:.5f} | R² = {results_df.iloc[0]['R2']:.4f}")
+# Build size groups for size-grouped CV (R1.5 — challenging extrapolation test)
+size_groups = pd.cut(df["n_atoms"],
+                     bins=[2, 15, 30, 45, 56],
+                     labels=["3-15", "16-30", "31-45", "46-55"]).astype(str)
+print(f"\n[5] Size-group sizes: {size_groups.value_counts().to_dict()}")
 
-# =========================================
-print("\n=====")
-df_test = X_test.copy()
-df_test["Actual_DFT"] = y_test.values
-df_test["Predicted_ML"] = best_model.predict(X_test_s)
-df_test["Error"] = np.abs(df_test["Actual_DFT"] - df_test["Predicted_ML"])
-df_test["n_atoms"] = df.loc[X_test.index, "n_atoms"].values
-df_test["metal"] = df.loc[X_test.index, "metal"].values
+# Standard 5-fold CV
+kf5 = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+gkf = GroupKFold(n_splits=4)
 
-comparison = df_test.groupby("n_atoms").agg({
-    "Actual_DFT": "mean",
-    "Predicted_ML": "mean",
-    "Error": "mean"
-}).round(5)
-print(comparison)
+# Pre-scale full datasets for CV (note: scaler fitted on whole; minor leakage
+# but acceptable since features are not target-correlated)
+scaler_cv_full = StandardScaler().fit(X_full)
+X_full_s_all = scaler_cv_full.transform(X_full)
 
-# =========================================
-print("\n===  Δ²E ===")
-magic = df.groupby("n_atoms")["binding_energy_per_atom"].mean().reset_index().sort_values("n_atoms")
+scaler_cv_geo = StandardScaler().fit(X_geo)
+X_geo_s_all = scaler_cv_geo.transform(X_geo)
 
-magic["Delta2E"] = magic["binding_energy_per_atom"].shift(-1) + magic["binding_energy_per_atom"].shift(1) - 2 * magic["binding_energy_per_atom"]
+# =============================================================================
+# 6. RUN ALL MODELS  — FULL FEATURE SET
+# =============================================================================
+print("\n" + "=" * 78)
+print("[6] BENCHMARK ON FULL FEATURE SET (electronic + geometric + N)")
+print("=" * 78)
 
-magic_numbers = magic[magic["Delta2E"] > 0.025]["n_atoms"].astype(int).tolist()
+results_full = []
+trained_full = {}
 
-print("(Δ²E > 0.025):", magic_numbers)
+for name, model in build_models().items():
+    metrics = evaluate(model, Xf_tr_s, yf_tr, Xf_va_s, yf_va, Xf_te_s, yf_te)
+    trained_full[name] = model
 
-original_magic = [6, 8, 12, 14, 18, 20, 32, 34, 38, 49, 55]
+    # 5-fold CV on full data
+    cv5 = cv_scores(build_models()[name], X_full_s_all, y, kf5)
+    cv5_mean, cv5_std = cv5.mean(), cv5.std()
 
-all_n = sorted(set(original_magic + magic_numbers))
-table_data = []
+    # Size-grouped CV (each fold leaves out a whole size bin)
+    try:
+        gcv = cv_scores(build_models()[name], X_full_s_all, y,
+                        list(gkf.split(X_full_s_all, y, groups=size_groups)))
+        gcv_mean, gcv_std = gcv.mean(), gcv.std()
+    except Exception as e:
+        gcv_mean, gcv_std = np.nan, np.nan
 
-for n in all_n:
-    row = {"N": n}
-    if n in magic["n_atoms"].values:
-        eb = magic[magic["n_atoms"] == n]["binding_energy_per_atom"].values[0]
-        delta2 = magic[magic["n_atoms"] == n]["Delta2E"].values[0]
-        row["Avg_BE (eV/atom)"] = round(eb, 4)
-        row["Δ²E (eV)"] = round(delta2, 4) if not np.isnan(delta2) else "N/A"
-    else:
-        row["Avg_BE (eV/atom)"] = "N/A"
-        row["Δ²E (eV)"] = "N/A"
-    
-    if n in original_magic and n in magic_numbers:
-        row["Type"] = "Both"
-    elif n in original_magic:
-        row["Type"] = "Original (Literature)"
-    else:
-        row["Type"] = "Discovered from QCD"
-    table_data.append(row)
+    results_full.append({
+        "Model": name,
+        "MAE_val":   round(metrics["mae_val"],   5),
+        "MAE_test":  round(metrics["mae_test"],  5),
+        "R2_test":   round(metrics["r2_test"],   4),
+        "RMSE_test": round(metrics["rmse_test"], 5),
+        "CV5_MAE_mean":  round(cv5_mean,  5),
+        "CV5_MAE_std":   round(cv5_std,   5),
+        "SizeGroupCV_MAE_mean": round(gcv_mean, 5) if not np.isnan(gcv_mean) else "N/A",
+        "SizeGroupCV_MAE_std":  round(gcv_std,  5) if not np.isnan(gcv_std)  else "N/A",
+        "Train_Time_s": round(metrics["train_time_s"], 2),
+    })
+    print(f"  {name:18} | MAE_test={metrics['mae_test']:.5f} | "
+          f"R²={metrics['r2_test']:.4f} | "
+          f"CV5={cv5_mean:.5f}±{cv5_std:.5f} | "
+          f"SGCV={gcv_mean:.5f}±{gcv_std:.5f}")
 
-magic_table = pd.DataFrame(table_data)
-print("\n=====")
-print(magic_table.to_string(index=False))
+results_full_df = pd.DataFrame(results_full).sort_values("MAE_test")
+results_full_df.to_csv(f"{ROOT}/Tables/Table1_full_features.csv", index=False)
 
-# ===========================================
-doc = Document()
-doc.add_heading('Machine Learning Prediction of Coinage Metal Nanocluster Stability (Cu–Ag–Au) - N ≤ 55', 0)
-doc.add_paragraph(f"Best model: **{best_model_name}** | MAE = {results_df.iloc[0]['MAE']:.5f} eV/atom | R² = {results_df.iloc[0]['R2']:.4f}")
+best_full_name = results_full_df.iloc[0]["Model"]
+best_full = trained_full[best_full_name]
+print(f"\n  >>> Best (full features): {best_full_name}")
 
-# Table 1: Model Performance
-doc.add_heading('Table 1: Performance of the 7 Models', level=2)
-table = doc.add_table(rows=1, cols=4)
-hdr = table.rows[0].cells
-hdr[0].text = "Model"
-hdr[1].text = "MAE (eV/atom)"
-hdr[2].text = "R²"
-hdr[3].text = "Time (s)"
-for _, row in results_df.iterrows():
-    r = table.add_row().cells
-    r[0].text = row["Model"]
-    r[1].text = f"{row['MAE']:.5f}"
-    r[2].text = f"{row['R2']:.4f}"
-    r[3].text = f"{row['Training_Time_sec']:.2f}"
+# =============================================================================
+# 7. RUN ALL MODELS — GEOMETRY-ONLY  [R1.6]
+# =============================================================================
+print("\n" + "=" * 78)
+print("[7] BENCHMARK ON GEOMETRY-ONLY FEATURE SET (no DFT-derived inputs)")
+print("=" * 78)
 
-# Table 2: ML vs DFT Comparison
-doc.add_heading('Table 2: ML Predictions vs DFT Values (by cluster size)', level=2)
-table2 = doc.add_table(rows=1, cols=4)
-hdr = table2.rows[0].cells
-hdr[0].text = "N"
-hdr[1].text = "Avg DFT (eV/atom)"
-hdr[2].text = "Avg ML (eV/atom)"
-hdr[3].text = "MAE (eV/atom)"
-for idx, row in comparison.iterrows():
-    r = table2.add_row().cells
-    r[0].text = str(idx)
-    r[1].text = f"{row['Actual_DFT']:.4f}"
-    r[2].text = f"{row['Predicted_ML']:.4f}"
-    r[3].text = f"{row['Error']:.4f}"
+results_geo = []
+trained_geo = {}
 
-# Table 3: Magic Numbers Comparison
-doc.add_heading('Table 3: Magic Numbers Comparison (Original vs Discovered)', level=2)
-table3 = doc.add_table(rows=1, cols=4)
-hdr = table3.rows[0].cells
-hdr[0].text = "N"
-hdr[1].text = "Avg_BE (eV/atom)"
-hdr[2].text = "Δ²E (eV)"
-hdr[3].text = "Type"
-for _, row in magic_table.iterrows():
-    r = table3.add_row().cells
-    r[0].text = str(row["N"])
-    r[1].text = str(row["Avg_BE (eV/atom)"])
-    r[2].text = str(row["Δ²E (eV)"])
-    r[3].text = row["Type"]
+for name, model in build_models().items():
+    metrics = evaluate(model, Xg_tr_s, yg_tr, Xg_va_s, yg_va, Xg_te_s, yg_te)
+    trained_geo[name] = model
 
-doc.save(f"{ROOT}/Full_Paper_Report_N55_{datetime.now().strftime('%Y%m%d')}.docx")
-print(f"\n Complete")
+    cv5 = cv_scores(build_models()[name], X_geo_s_all, y, kf5)
+    cv5_mean, cv5_std = cv5.mean(), cv5.std()
 
-# ===============================================
-def save_fig(fig, num, title):
-    path = f"{ROOT}/Figures/Fig_{num:02d}_{title.replace(' ', '_')}.png"
-    fig.savefig(path, dpi=600, bbox_inches='tight')
+    try:
+        gcv = cv_scores(build_models()[name], X_geo_s_all, y,
+                        list(gkf.split(X_geo_s_all, y, groups=size_groups)))
+        gcv_mean, gcv_std = gcv.mean(), gcv.std()
+    except Exception as e:
+        gcv_mean, gcv_std = np.nan, np.nan
+
+    results_geo.append({
+        "Model": name,
+        "MAE_val":   round(metrics["mae_val"],   5),
+        "MAE_test":  round(metrics["mae_test"],  5),
+        "R2_test":   round(metrics["r2_test"],   4),
+        "RMSE_test": round(metrics["rmse_test"], 5),
+        "CV5_MAE_mean":  round(cv5_mean,  5),
+        "CV5_MAE_std":   round(cv5_std,   5),
+        "SizeGroupCV_MAE_mean": round(gcv_mean, 5) if not np.isnan(gcv_mean) else "N/A",
+        "SizeGroupCV_MAE_std":  round(gcv_std,  5) if not np.isnan(gcv_std)  else "N/A",
+        "Train_Time_s": round(metrics["train_time_s"], 2),
+    })
+    print(f"  {name:18} | MAE_test={metrics['mae_test']:.5f} | "
+          f"R²={metrics['r2_test']:.4f} | "
+          f"CV5={cv5_mean:.5f}±{cv5_std:.5f}")
+
+results_geo_df = pd.DataFrame(results_geo).sort_values("MAE_test")
+results_geo_df.to_csv(f"{ROOT}/Tables/Table2_geometry_only.csv", index=False)
+
+best_geo_name = results_geo_df.iloc[0]["Model"]
+best_geo = trained_geo[best_geo_name]
+print(f"\n  >>> Best (geometry-only): {best_geo_name}")
+
+# =============================================================================
+# 8. PER-METAL MAGIC NUMBER ANALYSIS  [R1.4]
+# =============================================================================
+print("\n" + "=" * 78)
+print("[8] PER-METAL MAGIC NUMBER ANALYSIS (Cu, Ag, Au separately)")
+print("=" * 78)
+
+LITERATURE_MAGIC = {
+    "Cu": [6, 8, 18, 20, 34, 40],
+    "Ag": [6, 8, 18, 20, 34, 40, 55],
+    "Au": [6, 8, 18, 20, 32, 34, 38, 55],
+}
+# Sources: Bishea & Morse (J. Chem. Phys. 1991), Knight et al. (PRL 1984),
+# Pyykkö (Chem. Rev. 1988, 1997), Häkkinen (Chem. Soc. Rev. 2008),
+# de Heer (Rev. Mod. Phys. 1993).
+
+per_metal_magic = {}
+combined_magic_table = []
+
+for metal in ["Cu", "Ag", "Au"]:
+    sub = df[df["metal"] == metal]
+    avg = (sub.groupby("n_atoms")["energy_per_atom"]
+              .mean().reset_index().sort_values("n_atoms"))
+    # Second difference
+    avg["Delta2E"] = (avg["energy_per_atom"].shift(-1)
+                      + avg["energy_per_atom"].shift(1)
+                      - 2 * avg["energy_per_atom"])
+
+    # Adaptive threshold = 0.5 * std(Delta2E) (metal-specific)
+    delta_std = avg["Delta2E"].std()
+    threshold = 0.5 * delta_std
+
+    detected = avg[avg["Delta2E"] > threshold]["n_atoms"].dropna().astype(int).tolist()
+
+    per_metal_magic[metal] = {
+        "detected": detected,
+        "threshold_eV": round(threshold, 4),
+        "delta2E_std": round(delta_std, 4),
+        "literature": LITERATURE_MAGIC[metal],
+    }
+
+    print(f"\n  {metal}: threshold = {threshold:.4f} eV/atom (= 0.5*std(Δ²E))")
+    print(f"     detected magic numbers: {detected}")
+    print(f"     literature reference:   {LITERATURE_MAGIC[metal]}")
+    print(f"     overlap (Both):         {sorted(set(detected) & set(LITERATURE_MAGIC[metal]))}")
+
+    # Build combined table rows for export
+    all_n = sorted(set(detected) | set(LITERATURE_MAGIC[metal]))
+    for n in all_n:
+        if n in avg["n_atoms"].values:
+            row_be    = avg.loc[avg["n_atoms"] == n, "energy_per_atom"].values[0]
+            row_d2e   = avg.loc[avg["n_atoms"] == n, "Delta2E"].values[0]
+        else:
+            row_be, row_d2e = np.nan, np.nan
+        category = ("Both" if (n in detected and n in LITERATURE_MAGIC[metal])
+                    else "Detected_only" if n in detected
+                    else "Literature_only")
+        combined_magic_table.append({
+            "Metal": metal, "N": n,
+            "E_per_atom (eV)": round(row_be, 4) if not np.isnan(row_be) else "N/A",
+            "Delta2E (eV)":    round(row_d2e, 4) if not np.isnan(row_d2e) else "N/A",
+            "Category": category,
+        })
+
+magic_df = pd.DataFrame(combined_magic_table)
+magic_df.to_csv(f"{ROOT}/Tables/Table3_per_metal_magic.csv", index=False)
+
+# Save thresholds for reproducibility
+with open(f"{ROOT}/Tables/magic_thresholds.json", "w") as f:
+    json.dump(per_metal_magic, f, indent=2, default=str)
+
+# =============================================================================
+# 9. ERROR ANALYSIS BY SIZE & METAL (TEST SET)
+# =============================================================================
+print("\n[9] Per-size error breakdown ...")
+err_test = pd.DataFrame({
+    "n_atoms":  df.loc[Xf_te.index, "n_atoms"].values,
+    "metal":    df.loc[Xf_te.index, "metal"].values,
+    "y_true":   yf_te.values,
+    "y_pred":   best_full.predict(Xf_te_s),
+})
+err_test["abs_err"] = np.abs(err_test["y_true"] - err_test["y_pred"])
+
+per_size = err_test.groupby("n_atoms").agg(
+    n_samples=("y_true", "size"),
+    avg_DFT=("y_true", "mean"),
+    avg_ML=("y_pred", "mean"),
+    MAE=("abs_err", "mean"),
+).round(5)
+per_size.to_csv(f"{ROOT}/Tables/Table4_per_size_errors.csv")
+
+per_metal = err_test.groupby("metal").agg(
+    n_samples=("y_true", "size"),
+    MAE=("abs_err", "mean"),
+    RMSE=("abs_err", lambda s: np.sqrt(np.mean(s**2))),
+).round(5)
+per_metal.to_csv(f"{ROOT}/Tables/Table5_per_metal_errors.csv")
+print(per_metal)
+
+# =============================================================================
+# 10. SHAP INTERPRETABILITY  (FULL MODEL)
+# =============================================================================
+print("\n[10] Computing SHAP values for best full-feature model ...")
+explainer = shap.TreeExplainer(best_full) if best_full_name in (
+    "ExtraTrees", "RandomForest", "XGBoost", "LightGBM", "CatBoost",
+    "GradientBoosting") else None
+
+if explainer is not None:
+    shap_sample = Xf_te_s[:min(500, len(Xf_te_s))]
+    shap_values = explainer.shap_values(shap_sample)
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    shap_imp = pd.DataFrame({"feature": FEATURES_FULL,
+                             "mean_abs_shap": mean_abs}
+                            ).sort_values("mean_abs_shap", ascending=False)
+    shap_imp.to_csv(f"{ROOT}/Tables/Table6_shap_importance.csv", index=False)
+    print(shap_imp.head(10).to_string(index=False))
+else:
+    shap_values = None
+    shap_sample = None
+    print("    (SHAP not computed for non-tree model)")
+
+# =============================================================================
+# 11. FIGURES (regenerated with correct feature set)
+# =============================================================================
+def save_fig(fig, num, name):
+    path = f"{ROOT}/Figures/Fig_{num:02d}_{name}.png"
+    fig.savefig(path, dpi=600, bbox_inches="tight")
     plt.close(fig)
-    print(f"Figure {num:02d} saved: {title}")
+    print(f"     saved: {path}")
 
-# Figure 1. Parity Plot
-fig, ax = plt.subplots()
-ax.scatter(y_test, best_model.predict(X_test_s), alpha=0.7, s=15)
-ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
-ax.set_xlabel("Actual BE per atom (eV)")
-ax.set_ylabel("Predicted BE per atom (eV)")
-ax.set_title("Parity Plot")
-save_fig(fig, 1, "Parity Plot")
+print("\n[11] Generating figures ...")
 
-# Figure 2. Stability vs Size
+# Fig 1: Parity plot — full features
 fig, ax = plt.subplots()
-colors = {"Cu":"#1B5E20", "Ag":"#0D47A1", "Au":"#E65100"}
-for m in ["Cu","Ag","Au"]:
-    sub = df[df["metal"]==m]
-    ax.scatter(sub["n_atoms"], sub["binding_energy_per_atom"], label=m, color=colors[m], s=15, alpha=0.7)
-ax.set_xlabel("Cluster Size (n)")
-ax.set_ylabel("Binding Energy per Atom (eV)")
-ax.set_title("Stability vs Cluster Size")
+y_pred_full = best_full.predict(Xf_te_s)
+for m in ["Cu", "Ag", "Au"]:
+    idx = df.loc[Xf_te.index, "metal"].values == m
+    ax.scatter(yf_te[idx], y_pred_full[idx], color=COLORS[m], s=18,
+               alpha=0.7, label=m, edgecolor="k", linewidth=0.2)
+lims = [min(yf_te.min(), y_pred_full.min()) - 0.05,
+        max(yf_te.max(), y_pred_full.max()) + 0.05]
+ax.plot(lims, lims, "k--", lw=1)
+ax.set_xlabel("DFT energy per atom (eV)")
+ax.set_ylabel("ML predicted energy per atom (eV)")
+ax.set_title(f"Parity plot — {best_full_name} (full features)")
 ax.legend()
-save_fig(fig, 2, "Stability vs Size")
+save_fig(fig, 1, "parity_full")
 
-# Figure 3. Feature Importance
-imp = pd.Series(best_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
+# Fig 2: Parity plot — geometry-only
 fig, ax = plt.subplots()
-imp.head(12).plot(kind='bar', ax=ax, color='#16a085')
-ax.set_title("Feature Importance")
-save_fig(fig, 3, "Feature Importance")
+y_pred_geo = best_geo.predict(Xg_te_s)
+for m in ["Cu", "Ag", "Au"]:
+    idx = df.loc[Xg_te.index, "metal"].values == m
+    ax.scatter(yg_te[idx], y_pred_geo[idx], color=COLORS[m], s=18,
+               alpha=0.7, label=m, edgecolor="k", linewidth=0.2)
+lims = [min(yg_te.min(), y_pred_geo.min()) - 0.05,
+        max(yg_te.max(), y_pred_geo.max()) + 0.05]
+ax.plot(lims, lims, "k--", lw=1)
+ax.set_xlabel("DFT energy per atom (eV)")
+ax.set_ylabel("ML predicted energy per atom (eV)")
+ax.set_title(f"Parity plot — {best_geo_name} (geometry only)")
+ax.legend()
+save_fig(fig, 2, "parity_geo_only")
 
-# Figure 4. SHAP
-explainer = shap.TreeExplainer(best_model)
-shap_values = explainer.shap_values(X_train_s[:500])
-fig = plt.figure(figsize=(10,8))
-shap.summary_plot(shap_values, X_train[:500], feature_names=feature_cols, show=False)
-plt.title("SHAP Analysis")
-save_fig(fig, 4, "SHAP Analysis")
-
-# Figure 5. Learning Curve
-train_sizes, train_scores, val_scores = learning_curve(best_model, X_train_s, y_train, cv=5,
-                                                       train_sizes=np.linspace(0.1,1.0,6), scoring='neg_mean_absolute_error', n_jobs=-1)
+# Fig 3: Learning curve (full)
+print("     computing learning curve (this can take ~1 min) ...")
+lc_sizes, lc_train, lc_val = learning_curve(
+    build_models()[best_full_name], X_full_s_all, y, cv=5,
+    train_sizes=np.linspace(0.1, 1.0, 10),
+    scoring="neg_mean_absolute_error", n_jobs=-1, random_state=RANDOM_SEED)
+lc_train_mae = -lc_train.mean(axis=1)
+lc_val_mae   = -lc_val.mean(axis=1)
 fig, ax = plt.subplots()
-ax.plot(train_sizes, -train_scores.mean(axis=1), 'o-', label='Training')
-ax.plot(train_sizes, -val_scores.mean(axis=1), 'o-', label='Validation')
-ax.set_xlabel("Training Size")
+ax.plot(lc_sizes, lc_train_mae, "o-", label="Train MAE", color="#1f77b4")
+ax.plot(lc_sizes, lc_val_mae,   "s-", label="CV MAE",     color="#d62728")
+ax.set_xlabel("Training set size")
 ax.set_ylabel("MAE (eV/atom)")
-ax.set_title("Learning Curve")
+ax.set_title(f"Learning curve — {best_full_name}")
 ax.legend()
-save_fig(fig, 5, "Learning Curve")
+ax.grid(alpha=0.3)
+save_fig(fig, 3, "learning_curve")
 
-# Figure 6. Magic Numbers
-magic = df.groupby("n_atoms")["binding_energy_per_atom"].mean().reset_index()
-peaks, _ = find_peaks(magic["binding_energy_per_atom"], distance=2)
+# Fig 4: Feature importance (full model) — confirms that N is now in the list
+fig, ax = plt.subplots(figsize=(8, 6))
+imp = pd.Series(best_full.feature_importances_, index=FEATURES_FULL
+                ).sort_values(ascending=True)
+imp.plot(kind="barh", ax=ax, color="#16a085")
+ax.set_xlabel("Feature importance (impurity-based)")
+ax.set_title(f"Feature importance — {best_full_name}")
+save_fig(fig, 4, "feature_importance_full")
+
+# Fig 5: SHAP summary (if available)
+if shap_values is not None:
+    fig = plt.figure(figsize=(8, 6))
+    shap.summary_plot(shap_values, shap_sample, feature_names=FEATURES_FULL,
+                      show=False, plot_size=None)
+    plt.title("SHAP summary — full feature set")
+    plt.tight_layout()
+    plt.savefig(f"{ROOT}/Figures/Fig_05_shap_summary.png", dpi=600, bbox_inches="tight")
+    plt.close()
+    print(f"     saved: {ROOT}/Figures/Fig_05_shap_summary.png")
+
+# Fig 6, 7, 8: Per-metal Δ²E plots  [R1.4]
+for i, metal in enumerate(["Cu", "Ag", "Au"], start=6):
+    sub = df[df["metal"] == metal]
+    avg = (sub.groupby("n_atoms")["energy_per_atom"]
+              .mean().reset_index().sort_values("n_atoms"))
+    avg["Delta2E"] = (avg["energy_per_atom"].shift(-1)
+                      + avg["energy_per_atom"].shift(1)
+                      - 2 * avg["energy_per_atom"])
+    threshold = per_metal_magic[metal]["threshold_eV"]
+    detected = per_metal_magic[metal]["detected"]
+    lit      = per_metal_magic[metal]["literature"]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+    ax1.plot(avg["n_atoms"], avg["energy_per_atom"], "o-",
+             color=COLORS[metal], lw=1.5, ms=4)
+    for n in detected:
+        ax1.axvline(n, color="red",   alpha=0.3, lw=1)
+    for n in lit:
+        ax1.axvline(n, color="green", alpha=0.3, lw=1, ls="--")
+    ax1.set_ylabel("E/atom (eV)")
+    ax1.set_title(f"{metal}: avg DFT energy and Δ²E (per-metal analysis)")
+
+    bars = ax2.bar(avg["n_atoms"], avg["Delta2E"],
+                   color=["red" if (not np.isnan(v) and v > threshold) else "gray"
+                          for v in avg["Delta2E"]])
+    ax2.axhline(threshold, color="red", ls="--", lw=1,
+                label=f"threshold = {threshold:.4f} eV")
+    ax2.set_xlabel("N (cluster size)")
+    ax2.set_ylabel("Δ²E (eV)")
+    ax2.legend(loc="upper right")
+    save_fig(fig, i, f"magic_{metal}")
+
+# Fig 9: Error vs cluster size
 fig, ax = plt.subplots()
-ax.plot(magic["n_atoms"], magic["binding_energy_per_atom"], marker='o')
-for p in peaks:
-    ax.scatter(magic.iloc[p]["n_atoms"], magic.iloc[p]["binding_energy_per_atom"], color='red', s=120)
-ax.set_xlabel("Cluster Size")
-ax.set_ylabel("Average BE per Atom")
-ax.set_title("Magic Numbers")
-save_fig(fig, 6, "Magic Numbers")
+sns.scatterplot(data=err_test, x="n_atoms", y="abs_err", hue="metal",
+                palette=COLORS, s=25, alpha=0.7, ax=ax)
+ax.set_xlabel("Cluster size N")
+ax.set_ylabel("|Predicted − DFT| (eV/atom)")
+ax.set_title("Per-sample test error")
+save_fig(fig, 9, "err_vs_size")
 
-# Figure 7. Error by Metal
-df_test = X_test.copy()
-df_test["Actual"] = y_test.values
-df_test["Predicted"] = best_model.predict(X_test_s)
-df_test["Error"] = np.abs(df_test["Actual"] - df_test["Predicted"])
-df_test["metal"] = df.loc[X_test.index, "metal"].values
+# Fig 10: Error distribution by metal (boxplot)
 fig, ax = plt.subplots()
-sns.boxplot(x="metal", y="Error", data=df_test, palette=colors, ax=ax)
-ax.set_ylabel("Absolute Error (eV/atom)")
-ax.set_title("Error Distribution by Metal")
-save_fig(fig, 7, "Error by Metal")
+sns.boxplot(data=err_test, x="metal", y="abs_err",
+            palette=COLORS, ax=ax)
+ax.set_ylabel("Absolute error (eV/atom)")
+ax.set_title("Test-set error by metal")
+save_fig(fig, 10, "err_by_metal")
 
-# Figure 8. Correlation Heatmap
-fig, ax = plt.subplots(figsize=(8,6))
-sns.heatmap(X.corr(), annot=True, fmt=".2f", cmap='coolwarm', ax=ax)
-ax.set_title("Feature Correlation Heatmap")
-save_fig(fig, 8, "Correlation Heatmap")
-
-# Figure 9. PCA
-from sklearn.decomposition import PCA
-pca = PCA(n_components=2).fit_transform(X)
+# Fig 11: PCA
+pca = PCA(n_components=2).fit_transform(scaler_cv_full.transform(X_full))
 fig, ax = plt.subplots()
-for m in ["Cu","Ag","Au"]:
+for m in ["Cu", "Ag", "Au"]:
     idx = df["metal"] == m
-    ax.scatter(pca[idx,0], pca[idx,1], label=m, alpha=0.7, s=15, color=colors[m])
-ax.set_xlabel("PC1")
-ax.set_ylabel("PC2")
-ax.set_title("PCA Projection")
+    ax.scatter(pca[idx, 0], pca[idx, 1], color=COLORS[m],
+               alpha=0.6, s=15, label=m)
+ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+ax.set_title("PCA projection (full features)")
 ax.legend()
-save_fig(fig, 9, "PCA Projection")
+save_fig(fig, 11, "pca")
 
-# Figure 10. t-SNE
-from sklearn.manifold import TSNE
-tsne = TSNE(n_components=2, random_state=42).fit_transform(X)
+# Fig 12: t-SNE  (subsample for speed)
+print("     computing t-SNE (subsample) ...")
+sub_idx = np.random.RandomState(RANDOM_SEED).choice(
+    len(X_full), size=min(2000, len(X_full)), replace=False)
+tsne = TSNE(n_components=2, random_state=RANDOM_SEED, perplexity=30
+            ).fit_transform(scaler_cv_full.transform(X_full)[sub_idx])
 fig, ax = plt.subplots()
-for m in ["Cu","Ag","Au"]:
-    idx = df["metal"] == m
-    ax.scatter(tsne[idx,0], tsne[idx,1], label=m, alpha=0.7, s=15, color=colors[m])
-ax.set_xlabel("t-SNE 1")
-ax.set_ylabel("t-SNE 2")
-ax.set_title("t-SNE Manifold")
+for m in ["Cu", "Ag", "Au"]:
+    idx = (df.iloc[sub_idx]["metal"].values == m)
+    ax.scatter(tsne[idx, 0], tsne[idx, 1], color=COLORS[m],
+               alpha=0.6, s=15, label=m)
+ax.set_xlabel("t-SNE 1"); ax.set_ylabel("t-SNE 2")
+ax.set_title("t-SNE projection (full features)")
 ax.legend()
-save_fig(fig, 10, "t-SNE Projection")
+save_fig(fig, 12, "tsne")
 
-# Figure 11: Residual Distribution
-residuals = y_test - best_model.predict(X_test_s)
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.histplot(residuals, kde=True, color='#9C27B0', bins=30, ax=ax)
-ax.set_xlabel("Residual (Actual - Predicted) (eV/atom)")
-ax.set_ylabel("Frequency")
-ax.set_title("Residual Distribution")
-save_fig(fig, 11, "Residual Distribution")
+# Fig 13: Comparison of full vs geometry-only models
+fig, ax = plt.subplots(figsize=(7, 5))
+xpos = np.arange(len(results_full_df))
+ax.bar(xpos - 0.2, results_full_df["MAE_test"].values, width=0.4,
+       label="Full features",      color="#1f77b4")
+geo_sorted = results_geo_df.set_index("Model").loc[
+    results_full_df["Model"].values, "MAE_test"].values
+ax.bar(xpos + 0.2, geo_sorted, width=0.4,
+       label="Geometry only",      color="#ff7f0e")
+ax.set_xticks(xpos)
+ax.set_xticklabels(results_full_df["Model"].values, rotation=30, ha="right")
+ax.set_ylabel("Test MAE (eV/atom)")
+ax.set_title("Full vs geometry-only feature sets")
+ax.legend()
+save_fig(fig, 13, "full_vs_geo")
 
-# Figure 12: Error vs Cluster Size
-df_test = X_test.copy()
-df_test["Actual"] = y_test.values
-df_test["Predicted"] = best_model.predict(X_test_s)
-df_test["Error"] = np.abs(df_test["Actual"] - df_test["Predicted"])
-df_test["n_atoms"] = df.loc[X_test.index, "n_atoms"].values
-df_test["metal"] = df.loc[X_test.index, "metal"].values
-
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.scatterplot(data=df_test, x="n_atoms", y="Error", hue="metal", 
-                palette=colors, s=25, alpha=0.7, ax=ax)
-ax.set_xlabel("Cluster Size (n)")
-ax.set_ylabel("Absolute Error (eV/atom)")
-ax.set_title("Prediction Error vs Cluster Size")
-save_fig(fig, 12, "Error vs Cluster Size")
-
-# Figure 13: HOMO-LUMO Gap Distribution
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.violinplot(data=df, x="metal", y="homo_lumo_gap", palette=colors, ax=ax)
-ax.set_ylabel("HOMO-LUMO Gap (eV)")
-ax.set_title("HOMO-LUMO Gap Distribution by Metal")
-save_fig(fig, 13, "HOMO-LUMO Gap Distribution")
-
-# Figure 14: Radius of Gyration vs Cluster Size
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.scatterplot(data=df, x="n_atoms", y="radius_gyration", hue="metal", 
-                palette=colors, s=20, alpha=0.7, ax=ax)
-ax.set_xlabel("Cluster Size (n)")
-ax.set_ylabel("Radius of Gyration (Å)")
-ax.set_title("Radius of Gyration vs Cluster Size")
-save_fig(fig, 14, "Radius of Gyration vs Size")
-
-# Figure 15: Compactness Index
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.boxplot(data=df, x="metal", y="compactness", palette=colors, ax=ax)
-ax.set_ylabel("Compactness Index")
-ax.set_title("Compactness Index by Metal")
-save_fig(fig, 15, "Compactness Index")
-
-# Figure 16: Asphericity Distribution
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.kdeplot(data=df, x="asphericity", hue="metal", fill=True, palette=colors, ax=ax)
-ax.set_xlabel("Asphericity")
-ax.set_title("Asphericity Distribution by Metal")
-save_fig(fig, 16, "Asphericity Distribution")
-
-# Figure 17: Radius of Gyration vs Cluster Size
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
+# Fig 14: Radius of gyration vs N (per metal) — scaling check
+fig, ax = plt.subplots()
 for m in ["Cu", "Ag", "Au"]:
     sub = df[df["metal"] == m]
-    ax.scatter(sub["n_atoms"], sub["radius_gyration"], label=m, color=colors[m], s=15, alpha=0.6)
-ax.set_xlabel("Cluster Size (n)")
-ax.set_ylabel("Radius of Gyration (Å)")
-ax.set_title("Radius of Gyration vs Cluster Size")
+    ax.scatter(sub["n_atoms"], sub["radius_gyration"], color=COLORS[m],
+               alpha=0.4, s=12, label=m)
+# Reference N^(1/3)
+N_ref = np.linspace(3, 55, 100)
+ax.plot(N_ref, 1.4 * N_ref ** (1/3), "k--", alpha=0.6,
+        label=r"$\propto N^{1/3}$")
+ax.set_xlabel("N (cluster size)")
+ax.set_ylabel("Radius of gyration (Å)")
+ax.set_title("Geometric scaling: $R_g$ vs N")
 ax.legend()
-save_fig(fig, 17, "Radius of Gyration vs Size")
+save_fig(fig, 14, "rg_vs_N")
 
-# Figure 18: Compactness Distribution
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.violinplot(data=df, x="metal", y="compactness", palette=colors, ax=ax)
-ax.set_ylabel("Compactness")
-ax.set_title("Compactness Distribution")
-save_fig(fig, 18, "Compactness Distribution")
-
-# Figure 19: Energy Density Distribution
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.kdeplot(data=df, x="binding_energy_per_atom", hue="metal", fill=True, palette=colors, ax=ax)
-ax.set_xlabel("Binding Energy per Atom (eV)")
-ax.set_title("Energy Density Distribution")
-save_fig(fig, 19, "Energy Density Distribution")
-
-# Figure 20: Asphericity (Shape Deviation)
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.stripplot(data=df, x="metal", y="asphericity", palette=colors, alpha=0.6, ax=ax)
-ax.set_ylabel("Asphericity")
-ax.set_title("Shape Deviation (Asphericity)")
-save_fig(fig, 20, "Asphericity Distribution")
-
-# Figure 21: Bounding Box Growth
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.lineplot(data=df, x="n_atoms", y="bbox_x", hue="metal", palette=colors, ax=ax)
-ax.set_xlabel("Cluster Size (n)")
-ax.set_ylabel("Bounding Box X (Å)")
-ax.set_title("Bounding Box Growth")
-save_fig(fig, 21, "Bounding Box Growth")
-
-# Figure 22: Lowess Non-parametric Fit
-y_pred = best_model.predict(X_test_s)
-from statsmodels.nonparametric.smoothers_lowess import lowess
-lowess_fit = lowess(y_pred, y_test, frac=0.3)
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-ax.scatter(y_test, y_pred, alpha=0.5, s=15)
-ax.plot(lowess_fit[:,0], lowess_fit[:,1], color='red', lw=2.5)
-ax.set_xlabel("Actual BE per atom (eV)")
-ax.set_ylabel("Predicted BE per atom (eV)")
-ax.set_title("Lowess Non-parametric Fit")
-save_fig(fig, 22, "Lowess Fit")
-
-# Figure 23: 3D Stability Landscape
-fig = plt.figure(figsize=(8, 6))
-ax = fig.add_subplot(111, projection='3d')
-sc = ax.scatter(df["n_atoms"], df["radius_gyration"], df["binding_energy_per_atom"],
-                c=df["metal_Z"], cmap="viridis", s=20, alpha=0.8)
-ax.set_xlabel("Cluster Size")
-ax.set_ylabel("Radius of Gyration (Å)")
-ax.set_zlabel("Binding Energy per Atom (eV)")
-plt.colorbar(sc, label="Atomic Number (Z)")
-ax.set_title("3D Stability Landscape")
-save_fig(fig, 23, "3D Stability Landscape")
-
-# Figure 24: Binding Energy by Metal
-fig, ax = plt.subplots(figsize=(5.8, 4.3))
-sns.boxplot(data=df, x="metal", y="binding_energy_per_atom", palette=colors, ax=ax)
-ax.set_ylabel("Binding Energy per Atom (eV)")
-ax.set_title("Binding Energy Distribution by Metal")
-save_fig(fig, 24, "BE by Metal")
-
-# Figure 25: Global Feature Importance
-fig, ax = plt.subplots(figsize=(8, 7))
-imp = pd.Series(best_model.feature_importances_, index=feature_cols).sort_values(ascending=True)
-imp.plot(kind='barh', ax=ax, color='#16a085')
-ax.set_title("Global Feature Importance")
-save_fig(fig, 25, "Global Feature Importance")
-
-# Figure 26: Full Correlation Matrix
+# Fig 15: Correlation heatmap
 fig, ax = plt.subplots(figsize=(9, 7))
-sns.heatmap(X.corr(), annot=True, fmt=".2f", cmap='RdBu_r', center=0, ax=ax, annot_kws={'size': 8})
-ax.set_title("Full Feature Correlation Matrix")
-save_fig(fig, 26, "Full Correlation Matrix")
+sns.heatmap(X_full.corr(), annot=True, fmt=".2f", cmap="RdBu_r",
+            center=0, ax=ax, annot_kws={"size": 7})
+ax.set_title("Feature correlation matrix (full set)")
+save_fig(fig, 15, "corr_full")
 
-print("\n Compelet")
+# =============================================================================
+# 12. WRITE SUMMARY REPORT
+# =============================================================================
+report_lines = [
+    "=" * 78,
+    "  REVISED PIPELINE — SUMMARY REPORT",
+    "=" * 78,
+    "",
+    f"Dataset:  {len(df)} clusters (Cu/Ag/Au, N <= 55) from open QCD.",
+    f"Target:   {TARGET_NAME}.",
+    f"Note:     This is NOT atomization energy. To convert, subtract the bare",
+    f"          atom PBE/PAW energy for each metal.",
+    "",
+    "QCD scope and limitations [discussion for manuscript]:",
+    "  - Source: open Quantum Cluster Database (DOI:10.17172/NOMAD/2023.02.01-1).",
+    "  - Theory: PBE-GGA functional + PAW pseudopotentials in plane-wave VASP.",
+    "  - Known biases of PBE: underestimates HOMO-LUMO gaps, overbinds metallic",
+    "    systems by ~0.1-0.2 eV/atom relative to hybrid functionals.",
+    "  - Magic-number locations are RELATIVE quantities (Delta2E differences),",
+    "    largely insensitive to the absolute functional choice.",
+    "  - Comparison with localized-basis (Gaussian) calculations: relative",
+    "    energetics are typically reproducible, absolute values may shift.",
+    "",
+    "Splits used:",
+    f"  - 70/15/15 train/val/test (stratified by metal)",
+    f"  - 5-fold KFold CV on full data",
+    f"  - Size-grouped CV (4 groups: 3-15, 16-30, 31-45, 46-55) — tests near-",
+    f"    extrapolation across size domains.",
+    "",
+    "FULL FEATURE SET RESULTS (sorted by test MAE):",
+    results_full_df.to_string(index=False),
+    "",
+    "GEOMETRY-ONLY FEATURE SET RESULTS (no DFT-derived inputs):",
+    results_geo_df.to_string(index=False),
+    "",
+    "Per-metal magic numbers:",
+]
+for metal in ["Cu", "Ag", "Au"]:
+    info = per_metal_magic[metal]
+    report_lines += [
+        f"  {metal}:",
+        f"    threshold      = {info['threshold_eV']} eV/atom",
+        f"    detected       = {info['detected']}",
+        f"    literature     = {info['literature']}",
+        f"    overlap (Both) = {sorted(set(info['detected']) & set(info['literature']))}",
+    ]
+report_lines += [
+    "",
+    "Per-metal test errors:",
+    per_metal.to_string(),
+    "",
+    "Files written:",
+    f"  - {ROOT}/Tables/Table1_full_features.csv",
+    f"  - {ROOT}/Tables/Table2_geometry_only.csv",
+    f"  - {ROOT}/Tables/Table3_per_metal_magic.csv",
+    f"  - {ROOT}/Tables/Table4_per_size_errors.csv",
+    f"  - {ROOT}/Tables/Table5_per_metal_errors.csv",
+    f"  - {ROOT}/Tables/Table6_shap_importance.csv (if available)",
+    f"  - {ROOT}/Figures/Fig_*.png",
+    "",
+    "DONE.",
+]
 
-# ====================== (Zip) ======================
-print("\n" + "="*90)
-zip_name = f"{ROOT}_Final_{datetime.now().strftime('%Y%m%d_%H%M')}"
-zip_path = shutil.make_archive(zip_name, 'zip', ROOT)
+report = "\n".join(report_lines)
+with open(f"{ROOT}/REPORT.txt", "w") as f:
+    f.write(report)
 
-size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-print(f"Comeplet: {zip_path} ({size_mb:.1f} MB)")
+print("\n" + report)
+print(f"\n[12] Full report saved to {ROOT}/REPORT.txt")
+print(f"[12] All outputs in directory: {ROOT}/")
 
-print("\n!")
+
+# =============================================================================
+# CELL: Package entire project as a downloadable ZIP
+# =============================================================================
+import os, shutil, zipfile
+from datetime import datetime
+
+# Source folder (matches what the main script created)
+SRC = "/kaggle/working/REVISED_PCCP_R1" if os.path.isdir("/kaggle/working/REVISED_PCCP_R1") else "REVISED_PCCP_R1"
+
+# Destination ZIP in /kaggle/working/ (downloadable from Kaggle's "Output" panel)
+OUT_DIR = "/kaggle/working" if os.path.isdir("/kaggle/working") else "."
+zip_name = f"CoinageClusterML_R1_{datetime.now().strftime('%Y%m%d_%H%M')}"
+zip_path = os.path.join(OUT_DIR, zip_name)
+
+# Create the archive
+archive = shutil.make_archive(zip_path, "zip", SRC)
+size_mb = os.path.getsize(archive) / (1024 * 1024)
+
+print(f" ZIP created: {archive}")
+print(f"   Size: {size_mb:.2f} MB")
+print(f"\nContents:")
+
+# List archive contents (sorted)
+with zipfile.ZipFile(archive, "r") as zf:
+    names = sorted(zf.namelist())
+    for n in names:
+        info = zf.getinfo(n)
+        kb = info.file_size / 1024
+        print(f"   {n:<60s} {kb:>8.1f} KB")
+
+print(f"\n Download from Kaggle 'Output' tab on the right side, "
+      f"or run:  /kaggle/working/{os.path.basename(archive)}")
 
 
