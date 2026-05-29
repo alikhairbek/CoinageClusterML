@@ -339,14 +339,12 @@ If you use this code or framework in your work, please cite the manuscript:
 
 ```bibtex
 @article{Khairbek2026CoinageClusterML,
-  title   = {Interpretable Machine-Learning Prediction of DFT Energies per Atom
-             and Identification of Magic Numbers in Coinage-Metal Nanoclusters
-             (N $\leq$ 55) from the Open Quantum Cluster Database},
+  title   = {Interpretable machine-learning prediction of DFT energies per atom and identification of magic numbers in coinage-metal nanoclusters (N ≤ 55) from the open quantum cluster database},
   author  = {Khairbek, Ali A. and Al-Zaben, Maha I. and
              Alzahrani, Abdullah Yahya Abdullah and Thomas, Renjith},
   journal = {Physical Chemistry Chemical Physics},
   year    = {2026},
-  note    = {Submitted}
+  doi    = {https://doi.org/10.1039/D6CP01474G}
 }
 ```
 
@@ -385,9 +383,8 @@ The QCD reference data are distributed by Manna *et al.* under their own terms �
 | **Renjith Thomas** ¹,⁴ ✉ | Department of Chemistry, St Berchmans College (Autonomous), Mahatma Gandhi University, Kerala, India |
 
 **Corresponding authors:**
-- Prof. Renjith Thomas — `renjith@sbcollege.ac.in`
 - Dr. Ali A. Khairbek — `alikhairbek@gmail.com`
-
+- Prof. Renjith Thomas — `renjith@sbcollege.ac.in`
 ---
 
 ## Acknowledgements
